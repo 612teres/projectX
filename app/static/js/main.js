@@ -47,7 +47,7 @@ document.addEventListener('DOMContentLoaded', function() {
         }
         
         notificationContainer.innerHTML = `
-            <div class="rounded-lg shadow-lg ${bgColor} text-white p-4 flex items-start space-x-4">
+            <div class="rounded-lg shadow-lg ${bgColor} text-white p-4 flex items-start space-x-4 padding-20">
                 <div class="flex-shrink-0">
                     ${icon}
                 </div>
