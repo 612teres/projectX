@@ -86,10 +86,4 @@ flask run
 
 ## License
 
-This project is licensed under the MIT License - see the LICENSE file for details.
-
-## Developer
-
-- Name: FABIAN TERES
-- Email: [612teres@gmail.com](mailto:612teres@gmail)
-- GitHub: [https://github.com/612teres](https://github.com/612teres)
+This project is licensed under the MIT License - see the LICENSE file for details. 
