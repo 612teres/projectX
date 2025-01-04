@@ -6,8 +6,19 @@ from datetime import datetime, timedelta
 from app.google_calendar_integration import GoogleCalendarService
 import json
 from sqlalchemy.sql import func
+import os
+from werkzeug.utils import secure_filename
+from PIL import Image
+from io import BytesIO
 
 main = Blueprint('main', __name__)
+
+UPLOAD_FOLDER = 'app/static/uploads/avatars'
+ALLOWED_EXTENSIONS = {'png', 'jpg', 'jpeg', 'gif'}
+MAX_FILE_SIZE = 2 * 1024 * 1024  # 2MB
+
+def allowed_file(filename):
+    return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
 
 @main.route('/')
 def index():
@@ -80,6 +91,37 @@ def project_detail(project_id):
         completed_tasks=completed_tasks
     )
 
+@main.route('/project/<int:project_id>/delete', methods=['POST'])
+@login_required
+def delete_project(project_id):
+    project = Project.query.get_or_404(project_id)
+    
+    # Check if user has permission to delete the project
+    if project.owner_id != current_user.id:
+        flash('You do not have permission to delete this project.', 'error')
+        return redirect(url_for('main.dashboard'))
+    
+    try:
+        # Delete associated tasks and notifications
+        Task.query.filter_by(project_id=project_id).delete()
+        Notification.query.filter(
+            db.and_(
+                Notification.user_id == current_user.id,
+                Notification.message.like(f"%{project.title}%")
+            )
+        ).delete()
+        
+        # Delete the project
+        db.session.delete(project)
+        db.session.commit()
+        
+        flash('Project deleted successfully!', 'success')
+        return jsonify({'status': 'success', 'redirect': url_for('main.dashboard')})
+    except Exception as e:
+        db.session.rollback()
+        flash('Error deleting project. Please try again.', 'error')
+        return jsonify({'status': 'error', 'message': str(e)}), 500
+
 @main.route('/project/new', methods=['GET', 'POST'])
 @login_required
 def new_project():
@@ -101,8 +143,7 @@ def new_project():
         create_notification(
             current_user.id,
             f"New project created: {title}",
-            type='project',
-            related_id=project.id
+            notification_type='project'
         )
         
         flash('Project created successfully!', 'success')
@@ -141,8 +182,7 @@ def new_task():
             create_notification(
                 int(assignee_id),
                 f"You've been assigned a new task: {title}",
-                type='task',
-                related_id=task.id
+                notification_type='task'
             )
         
         # Notify project owner if different from assignee
@@ -150,8 +190,7 @@ def new_task():
             create_notification(
                 project.owner_id,
                 f"New task added to your project {project.title}: {title}",
-                type='task',
-                related_id=task.id
+                notification_type='task'
             )
         
         flash('Task created successfully!', 'success')
@@ -179,8 +218,7 @@ def update_task(task_id):
         create_notification(
             task.assignee_id,
             notification_message,
-            type='task',
-            related_id=task.id
+            notification_type='task'
         )
     
     # Notify project owner if different from current user and assignee
@@ -189,8 +227,7 @@ def update_task(task_id):
         create_notification(
             project.owner_id,
             notification_message,
-            type='task',
-            related_id=task.id
+            notification_type='task'
         )
     
     return jsonify({
@@ -282,47 +319,66 @@ def update_notifications():
     return redirect(url_for('main.profile', _anchor='notifications')) 
 
 @main.route('/api/notifications')
-@login_required
 def get_notifications():
-    notifications = current_user.user_notifications.order_by(Notification.timestamp.desc()).limit(50).all()
-    return jsonify([notification.to_dict() for notification in notifications])
+    if not current_user.is_authenticated:
+        return jsonify([])
+    notifications = Notification.query.filter_by(user_id=current_user.id)\
+        .order_by(Notification.timestamp.desc())\
+        .limit(10)\
+        .all()
+    return jsonify([{
+        'id': n.id,
+        'message': n.message,
+        'type': n.notification_type,
+        'timestamp': n.timestamp.isoformat(),
+        'read': n.read
+    } for n in notifications])
 
-@main.route('/api/notifications/mark-all-read', methods=['POST'])
-@login_required
-def mark_all_notifications_read():
-    current_user.user_notifications.filter_by(read=False).update({'read': True})
-    db.session.commit()
-    return jsonify({'status': 'success'})
-
-@main.route('/api/notifications/<int:notification_id>', methods=['DELETE'])
-@login_required
-def delete_notification(notification_id):
-    notification = current_user.user_notifications.filter_by(id=notification_id).first_or_404()
-    db.session.delete(notification)
-    db.session.commit()
-    return jsonify({'status': 'success'})
+@main.route('/api/notifications/unread-count')
+def get_unread_count():
+    if not current_user.is_authenticated:
+        return jsonify({'count': 0})
+    count = Notification.query.filter_by(user_id=current_user.id, read=False).count()
+    return jsonify({'count': count})
 
 @main.route('/api/notifications/<int:notification_id>/read', methods=['POST'])
-@login_required
 def mark_notification_read(notification_id):
-    notification = current_user.user_notifications.filter_by(id=notification_id).first_or_404()
+    if not current_user.is_authenticated:
+        return jsonify({'status': 'error', 'message': 'Not authenticated'}), 401
+    notification = Notification.query.get_or_404(notification_id)
+    if notification.user_id != current_user.id:
+        return jsonify({'status': 'error', 'message': 'Unauthorized'}), 403
     notification.read = True
     db.session.commit()
     return jsonify({'status': 'success'})
 
-def create_notification(user_id, message, type='default', related_id=None):
+@main.route('/api/notifications/mark-all-read', methods=['POST'])
+def mark_all_notifications_read():
+    if not current_user.is_authenticated:
+        return jsonify({'status': 'error', 'message': 'Not authenticated'}), 401
+    Notification.query.filter_by(user_id=current_user.id, read=False)\
+        .update({Notification.read: True})
+    db.session.commit()
+    return jsonify({'status': 'success'})
+
+def create_notification(user_id, message, notification_type='default'):
     """Helper function to create and send notifications"""
     notification = Notification(
         user_id=user_id,
         message=message,
-        type=type,
-        related_id=related_id
+        notification_type=notification_type
     )
     db.session.add(notification)
     db.session.commit()
     
     # Emit real-time notification via WebSocket
-    socketio.emit('notification', notification.to_dict(), room=str(user_id))
+    socketio.emit('notification', {
+        'id': notification.id,
+        'message': notification.message,
+        'type': notification.notification_type,
+        'timestamp': notification.timestamp.isoformat(),
+        'read': notification.read
+    }, room=str(user_id))
     return notification
 
 # Example: Create notification when a task is assigned
@@ -340,8 +396,7 @@ def assign_task(task_id):
         create_notification(
             user_id=assignee_id,
             message=f"You have been assigned to task: {task.title}",
-            notification_type='task',
-            related_id=task_id
+            notification_type='task'
         )
         
         return jsonify({'status': 'success'})
@@ -362,8 +417,7 @@ def check_project_deadlines():
         create_notification(
             user_id=project.owner_id,
             message=f"Project deadline approaching: {project.title}",
-            notification_type='project',
-            related_id=project.id
+            notification_type='project'
         ) 
 
 @main.route('/api/projects/deadlines')
@@ -473,8 +527,7 @@ def check_approaching_deadlines():
             create_notification(
                 project.owner_id,
                 f"Project '{project.title}' deadline approaching in {days_until} day{'s' if days_until != 1 else ''}!",
-                type='deadline',
-                related_id=project.id
+                notification_type='deadline'
             )
     
     # Check task deadlines
@@ -490,8 +543,7 @@ def check_approaching_deadlines():
             create_notification(
                 task.assignee_id,
                 f"Task '{task.title}' due in {days_until} day{'s' if days_until != 1 else ''}!",
-                type='deadline',
-                related_id=task.id
+                notification_type='deadline'
             )
 
 @main.before_request
@@ -499,3 +551,86 @@ def before_request():
     """Run deadline checks before each request"""
     if current_user.is_authenticated:
         check_approaching_deadlines() 
+
+@main.route('/profile/upload-avatar', methods=['POST'])
+@login_required
+def upload_avatar():
+    if 'avatar' not in request.files:
+        return jsonify({'status': 'error', 'message': 'No file provided'}), 400
+    
+    file = request.files['avatar']
+    if file.filename == '':
+        return jsonify({'status': 'error', 'message': 'No file selected'}), 400
+    
+    if not allowed_file(file.filename):
+        return jsonify({'status': 'error', 'message': 'Invalid file type'}), 400
+    
+    try:
+        # Create upload directory if it doesn't exist
+        os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+        
+        # Process and save the image
+        image = Image.open(file)
+        
+        # Convert to RGB if necessary
+        if image.mode != 'RGB':
+            image = image.convert('RGB')
+        
+        # Resize to a maximum size while maintaining aspect ratio
+        max_size = (500, 500)
+        image.thumbnail(max_size, Image.LANCZOS)
+        
+        # Generate unique filename
+        filename = secure_filename(f"avatar_{current_user.id}_{int(datetime.utcnow().timestamp())}.jpg")
+        filepath = os.path.join(UPLOAD_FOLDER, filename)
+        
+        # Save the processed image
+        image.save(filepath, 'JPEG', quality=85)
+        
+        # Update user's avatar URL
+        avatar_url = url_for('static', filename=f'uploads/avatars/{filename}')
+        current_user.avatar_url = avatar_url
+        db.session.commit()
+        
+        return jsonify({
+            'status': 'success',
+            'avatar_url': avatar_url
+        })
+    
+    except Exception as e:
+        return jsonify({'status': 'error', 'message': str(e)}), 500
+
+@main.route('/profile/set-default-avatar', methods=['POST'])
+@login_required
+def set_default_avatar():
+    data = request.get_json()
+    avatar_url = data.get('avatar_url')
+    
+    if not avatar_url:
+        return jsonify({'status': 'error', 'message': 'No avatar URL provided'}), 400
+    
+    try:
+        current_user.avatar_url = avatar_url
+        db.session.commit()
+        return jsonify({'status': 'success', 'avatar_url': avatar_url})
+    except Exception as e:
+        return jsonify({'status': 'error', 'message': str(e)}), 500
+
+@main.route('/profile/remove-avatar', methods=['POST'])
+@login_required
+def remove_avatar():
+    try:
+        # If user has a custom avatar, delete the file
+        if current_user.avatar_url and '/uploads/avatars/' in current_user.avatar_url:
+            filepath = os.path.join(app.root_path, 'static', 
+                                  current_user.avatar_url.split('/static/')[1])
+            if os.path.exists(filepath):
+                os.remove(filepath)
+        
+        # Reset to default avatar
+        current_user.avatar_url = None
+        db.session.commit()
+        
+        return jsonify({'status': 'success'})
+    except Exception as e:
+        return jsonify({'status': 'error', 'message': str(e)}), 500 

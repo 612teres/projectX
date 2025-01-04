@@ -12,6 +12,7 @@ class User(UserMixin, db.Model):
     email = db.Column(db.String(120), unique=True, nullable=False)
     password_hash = db.Column(db.String(128))
     bio = db.Column(db.Text)
+    avatar_url = db.Column(db.String(200))  # Store URL for uploaded or default avatar
     
     # Preferences
     default_view = db.Column(db.String(20), default='list')  # 'list' or 'kanban'
@@ -64,10 +65,12 @@ class Notification(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
     message = db.Column(db.String(500), nullable=False)
-    type = db.Column(db.String(50), default='default')  # 'task', 'project', 'mention', 'default'
-    read = db.Column(db.Boolean, default=False)
+    notification_type = db.Column(db.String(50), default='default')  # project, task, deadline, default
     timestamp = db.Column(db.DateTime, default=datetime.utcnow)
-    related_id = db.Column(db.Integer)  # ID of related item (task, project, etc.)
+    read = db.Column(db.Boolean, default=False)
+    
+    def __repr__(self):
+        return f'<Notification {self.id}>'
 
     def to_dict(self):
         return {
